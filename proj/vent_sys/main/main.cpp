@@ -43,6 +43,41 @@ const char *appKey = "3d23df2458d8fda3aadb1c3f2a6e4fe8";
 #define TTN_PIN_DIO0      26
 #define TTN_PIN_DIO1      33
 
+
+/**
+ * Brief:
+ * 
+ * GPIO status:
+ * GPIO32: output - FAN control
+ * GPIO34:  input, interrupt from rising edge and falling edge - zero sensor
+ * 
+ */
+#define FAN				32
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<FAN))
+#define ZERO_SENSOR			34
+#define GPIO_INPUT_PIN_SEL  ((1ULL<<ZERO_SENSOR))
+#define ESP_INTR_FLAG_DEFAULT 0
+
+xQueueHandle xQueueDIM;
+xQueueHandle xQueueISR;
+
+
+static void IRAM_ATTR gpio_isr_handler(void* arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+	if(gpio_num == ZERO_SENSOR){
+		gpio_set_intr_type(ZERO_SENSOR, GPIO_INTR_DISABLE);
+		xQueueSendFromISR(xQueueISR, &gpio_num, 0);
+	}
+}
+
+
+
+
+
+
+
+
 static TheThingsNetwork ttn;
 
 const unsigned TX_INTERVAL = 30;
@@ -59,6 +94,13 @@ void sendMessages(void* pvParameter)
         vTaskDelay(TX_INTERVAL * 1000 / portTICK_PERIOD_MS);
     }
 }
+
+
+
+
+
+
+
 
 extern "C" void app_main(void)
 {
@@ -93,6 +135,7 @@ extern "C" void app_main(void)
     {
         printf("Joined.\n");
         xTaskCreate(sendMessages, "send_messages", 1024 * 4, (void* )0, 3, nullptr);
+		xTaskCreate(venting, "fan_work", 1024 * 4,  NULL, 11, NULL);
     }
     else
     {
