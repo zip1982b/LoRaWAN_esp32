@@ -1,0 +1,6 @@
+build/
+sdkconfig
+sdkconfig.old
+dev_keys.txt
+LoRaWAN_esp32
+.vscode/
