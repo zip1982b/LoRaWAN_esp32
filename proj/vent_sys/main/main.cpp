@@ -85,9 +85,9 @@ typedef struct {
 
 xQueueHandle xQueueDIM;
 xQueueHandle xQueueISR;
-xSemaphoreHandle xBinSemaphore1;
-
-
+xSemaphoreHandle xBinSemaphoreZS;
+xSemaphoreHandle xBinSemaphoreT0;
+xSemaphoreHandle xBinSemaphoreT1;
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
@@ -95,13 +95,57 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
 	static portBASE_TYPE xHigherPriorityTaskWoken;
 	xHigherPriorityTaskWoken = pdFALSE;
 	if(gpio_num == ZERO_SENSOR){
-		xSemaphoreGiveFromISR(xBinSemaphore1, &xHigherPriorityTaskWoken);
+		xSemaphoreGiveFromISR(xBinSemaphoreZS, &xHigherPriorityTaskWoken);
 		if(xHigherPriorityTaskWoken)
 		{
 			taskYIELD_YIELD_FROM_ISR();
 		}
 	}
 }
+
+
+
+
+/*
+ * Timer group0 ISR handler
+ * switch on TRIAC
+ * switch off TRIAC
+ */
+void IRAM_ATTR timer_group0_isr(void *para)
+{
+    timer_spinlock_take(TIMER_GROUP_0);
+    int timer_idx = (int) para;
+	uint32_t timer_intr = timer_group_get_intr_status_in_isr(TIMER_GROUP_0);
+	
+	static portBASE_TYPE xHigherPriorityTaskWoken;
+	xHigherPriorityTaskWoken = pdFALSE;
+	
+	
+	if (timer_intr & TIMER_INTR_T0) {
+		timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
+		xSemaphoreGiveFromISR(xBinSemaphoreT0, &xHigherPriorityTaskWoken);
+		if(xHigherPriorityTaskWoken)
+		{
+			taskYIELD_YIELD_FROM_ISR();
+		}
+	}
+        
+    } 
+	else if (timer_intr & TIMER_INTR_T1) {
+        timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_1);
+		xSemaphoreGiveFromISR(xBinSemaphoreT1, &xHigherPriorityTaskWoken);
+		if(xHigherPriorityTaskWoken)
+		{
+			taskYIELD_YIELD_FROM_ISR();
+		}
+    } 
+    /* After the alarm has been triggered
+      we need enable it again, so it is triggered the next time */
+    timer_group_enable_alarm_in_isr(TIMER_GROUP_0, timer_idx);
+    timer_spinlock_give(TIMER_GROUP_0);
+}
+
+
 
 
 /* very high priority task*/
@@ -141,7 +185,7 @@ static void  t_isr_handler_ZS(void* arg)
 	
 	for(;;){
 		printf("Timer0 is configured  - Cicle - \n");
-		xSemaphoreTake(xBinSemaphore, portMAX_DELAY);
+		xSemaphoreTake(xBinSemaphoreZS, portMAX_DELAY);
 		xQueueReceive(xQueueDIM, &received_data, 0);
 		switch(received_data.speed){
 		case 0:
@@ -161,44 +205,61 @@ static void  t_isr_handler_ZS(void* arg)
 }
 
 
-
-
-
-/*
- * Timer group0 ISR handler
- * switch on TRIAC
- * switch off TRIAC
- */
-void IRAM_ATTR timer_group0_isr(void *para)
+/* very high priority task*/
+static void  t_isr_handler_T0(void* arg)
 {
-    //timer_spinlock_take(TIMER_GROUP_0);
-    int timer_idx = (int) para;
-    static portBASE_TYPE xHigherPriorityTaskWoken;
-	xHigherPriorityTaskWoken = pdFALSE;
-    timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, timer_idx);
-    
+	/*
+	1 - gpio_set_level(FAN, 1);
+	2 - T1 start;
+	*/
 	
+	/* Select and initialize basic parameters of the timer */
+    timer_config_t config;
+    config.divider = TIMER_DIVIDER;
+    config.counter_dir = TIMER_COUNT_UP;
+    config.counter_en = TIMER_PAUSE;
+    config.alarm_en = TIMER_ALARM_EN;
+    config.intr_type = TIMER_INTR_LEVEL;
+    config.auto_reload = WITH_RELOAD;
+#ifdef TIMER_GROUP_SUPPORTS_XTAL_CLOCK
+    config.clk_src = TIMER_SRC_CLK_APB;
+#endif
+    timer_init(TIMER_GROUP_0, TIMER_1, &config);
+
+    /* Timer's counter will initially start from value below.
+       Also, if auto_reload is set, this value will be automatically reload on alarm */
+    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0x00000000ULL);
+
+    /* Configure the alarm value and the interrupt on alarm. */
+    //timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, TIMER0_INTERVAL_DELAY * TIMER_SCALE);
+    timer_enable_intr(TIMER_GROUP_0, TIMER_1);
+    timer_isr_register(TIMER_GROUP_0, TIMER_1, timer_group0_isr, (void *) TIMER_1, ESP_INTR_FLAG_IRAM, NULL);
+
+	uint64_t alarm_value;
 	
-	
-	
-	
-	
-	xSemaphoreGiveFromISR(xBinSemaphore, &xHigherPriorityTaskWoken);
-		if(xHigherPriorityTaskWoken)
-		{
-			taskYIELD_YIELD_FROM_ISR();
+	for(;;){
+		printf("[t_isr_handler_T0] Timer1 is configured  - Cicle - \n");
+		xSemaphoreTake(xBinSemaphoreT0, portMAX_DELAY);
+		alarm_value = (uint64_t) TIMER1_INTERVAL_SWITCH_ON_TRIAC * TIMER_SCALE; // FAN switch on - 50% speed
+		printf('Alarm value [%d] ',  alarm_value);
+		timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, alarm_value); // а до скольки считать?	
+		timer_start(TIMER_GROUP_0, TIMER_1); //T1 start
+		gpio_set_level(FAN, 1); //FAN switch on 
 		}
 	}
-	
-	
-	
-
-    /* After the alarm has been triggered
-      we need enable it again, so it is triggered the next time */
-    timer_group_enable_alarm_in_isr(TIMER_GROUP_0, timer_idx);
-
-    //timer_spinlock_give(TIMER_GROUP_0);
 }
+
+
+/* very high priority task*/
+static void  t_isr_handler_T1(void* arg)
+{
+	/*
+	1 - gpio_set_level(FAN, 0);
+	*/
+	gpio_set_level(FAN, 0); //FAN switch off
+}
+
+
 
 
 
@@ -250,42 +311,6 @@ void sendMessages(void* pvParameter)
     }
 }
 
-
-/*
- * Initialize selected timer of the timer group 0
- *
- * timer_idx - the timer number to initialize
- * auto_reload - should the timer auto reload on alarm?
- * timer_interval_sec - the interval of alarm to set
- */
-static void tg0_timer_init(int timer_idx,
-    bool auto_reload, double timer_interval_sec)
-{
-    /* Select and initialize basic parameters of the timer */
-    timer_config_t config;
-    config.divider = TIMER_DIVIDER;
-    config.counter_dir = TIMER_COUNT_UP;
-    config.counter_en = TIMER_PAUSE;
-    config.alarm_en = TIMER_ALARM_EN;
-    config.intr_type = TIMER_INTR_LEVEL;
-    config.auto_reload = auto_reload;
-#ifdef TIMER_GROUP_SUPPORTS_XTAL_CLOCK
-    config.clk_src = TIMER_SRC_CLK_APB;
-#endif
-    timer_init(TIMER_GROUP_0, timer_idx, &config);
-
-    /* Timer's counter will initially start from value below.
-       Also, if auto_reload is set, this value will be automatically reload on alarm */
-    timer_set_counter_value(TIMER_GROUP_0, timer_idx, 0x00000000ULL);
-
-    /* Configure the alarm value and the interrupt on alarm. */
-    timer_set_alarm_value(TIMER_GROUP_0, timer_idx, timer_interval_sec * TIMER_SCALE);
-    timer_enable_intr(TIMER_GROUP_0, timer_idx);
-    timer_isr_register(TIMER_GROUP_0, timer_idx, timer_group0_isr,
-        (void *) timer_idx, ESP_INTR_FLAG_IRAM, NULL);
-
-    timer_start(TIMER_GROUP_0, timer_idx);
-}
 
 
 
@@ -339,6 +364,6 @@ extern "C" void app_main(void)
 	vSemaphoreCreateBinary(xBinarySemaphore1);
 	
 	xTaskCreate(t_isr_handler_ZS, "task isr handler Zero Sensor", 1024 * 4,  NULL, 12, NULL);
-	
-	
+	xTaskCreate(t_isr_handler_T0, "task isr handler T0", 1024 * 4,  NULL, 12, NULL);
+	xTaskCreate(t_isr_handler_T1, "task isr handler T1", 1024 * 4,  NULL, 12, NULL);
 }
