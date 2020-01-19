@@ -192,6 +192,7 @@ static void  t_isr_handler_ZS(void* arg)
 			gpio_set_level(FAN, 0); //FAN switch off
 			break;
 		case 1:
+			timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0x00000000ULL);
 			alarm_value = (uint64_t) SPEED_1 * TIMER_SCALE; // FAN switch on - 50% speed
 			printf('Alarm value [%d] ',  alarm_value);
 			timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, alarm_value); // а до скольки считать?	
@@ -240,12 +241,14 @@ static void  t_isr_handler_T0(void* arg)
 	for(;;){
 		printf("[t_isr_handler_T0] Timer1 is configured  - Cicle - \n");
 		xSemaphoreTake(xBinSemaphoreT0, portMAX_DELAY);
+		timer_pause(TIMER_GROUP_0, TIMER_0); //T0 pause
+		timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0x00000000ULL);
 		alarm_value = (uint64_t) TIMER1_INTERVAL_SWITCH_ON_TRIAC * TIMER_SCALE; // FAN switch on - 50% speed
 		printf('Alarm value [%d] ',  alarm_value);
 		timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, alarm_value); // а до скольки считать?	
 		timer_start(TIMER_GROUP_0, TIMER_1); //T1 start
 		gpio_set_level(FAN, 1); //FAN switch on 
-		}
+
 	}
 }
 
@@ -257,6 +260,13 @@ static void  t_isr_handler_T1(void* arg)
 	1 - gpio_set_level(FAN, 0);
 	*/
 	gpio_set_level(FAN, 0); //FAN switch off
+	
+	for(;;){
+		printf("[t_isr_handler_T1]   - Cicle - \n");
+		xSemaphoreTake(xBinSemaphoreT1, portMAX_DELAY);
+		timer_pause(TIMER_GROUP_0, TIMER_1); //T1 pause
+		gpio_set_level(FAN, 0); //FAN switch off
+	}
 }
 
 
