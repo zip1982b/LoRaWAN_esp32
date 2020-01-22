@@ -19,6 +19,9 @@
 #include "TheThingsNetwork.h"
 
 
+static const char* TAG = "LoRaWAN";
+
+
 // NOTE:
 // The LoRaWAN frequency and the radio chip must be configured by running 'make menuconfig'.
 // Go to Components / The Things Network, select the appropriate values and save.
@@ -66,16 +69,7 @@ const char *appKey = "3d23df2458d8fda3aadb1c3f2a6e4fe8";
 #define WITHOUT_RELOAD   0        
 #define WITH_RELOAD      1       
 
-/*
- * A sample structure to pass events
- * from the timer interrupt handler to the main program.
- */
-typedef struct {
-    int type;  // the type of timer's event
-    int timer_group;
-    int timer_idx;
-    uint64_t timer_counter_value;
-} timer_event_t;
+
 
 typedef struct {
     uint8_t speed; //0, 1 ,2
@@ -84,20 +78,30 @@ typedef struct {
 
 
 xQueueHandle xQueueDIM;
-xQueueHandle xQueueISR;
 xSemaphoreHandle xBinSemaphoreZS;
 xSemaphoreHandle xBinSemaphoreT0;
 xSemaphoreHandle xBinSemaphoreT1;
+
+
+
+
+
+
+
+
 
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
 	static portBASE_TYPE xHigherPriorityTaskWoken;
 	xHigherPriorityTaskWoken = pdFALSE;
+	ESP_LOGI(TAG, "[gpio_isr_handler] in ISR \n");
 	if(gpio_num == ZERO_SENSOR){
+		ESP_LOGI(TAG, "[gpio_isr_handler] event ZERO_SENSOR \n");
 		xSemaphoreGiveFromISR(xBinSemaphoreZS, &xHigherPriorityTaskWoken);
 		if(xHigherPriorityTaskWoken)
 		{
+			ESP_LOGI(TAG, "[gpio_isr_handler] xHigherPriorityTaskWoken = TRUE - Yield");
 			taskYIELD_YIELD_FROM_ISR();
 		}
 	}
@@ -115,13 +119,16 @@ void IRAM_ATTR timer_group0_isr(void *para)
 {
     timer_spinlock_take(TIMER_GROUP_0);
     int timer_idx = (int) para;
+	ESP_LOGI(TAG, "[timer_group0_isr] para = %d", timer_idx);
 	uint32_t timer_intr = timer_group_get_intr_status_in_isr(TIMER_GROUP_0);
 	
 	static portBASE_TYPE xHigherPriorityTaskWoken;
 	xHigherPriorityTaskWoken = pdFALSE;
+	ESP_LOGI(TAG, "[timer_group0_isr] in ISR");
 	
-	
+
 	if (timer_intr & TIMER_INTR_T0) {
+		ESP_LOGI(TAG, "[timer_group0_isr] T0 event");
 		timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
 		xSemaphoreGiveFromISR(xBinSemaphoreT0, &xHigherPriorityTaskWoken);
 		if(xHigherPriorityTaskWoken)
@@ -132,6 +139,7 @@ void IRAM_ATTR timer_group0_isr(void *para)
         
     } 
 	else if (timer_intr & TIMER_INTR_T1) {
+		ESP_LOGI(TAG, "[timer_group0_isr] T1 event");
         timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_1);
 		xSemaphoreGiveFromISR(xBinSemaphoreT1, &xHigherPriorityTaskWoken);
 		if(xHigherPriorityTaskWoken)
@@ -141,6 +149,7 @@ void IRAM_ATTR timer_group0_isr(void *para)
     } 
     /* After the alarm has been triggered
       we need enable it again, so it is triggered the next time */
+	ESP_LOGI(TAG, "[timer_group0_isr] enable alarm in isr\n");
     timer_group_enable_alarm_in_isr(TIMER_GROUP_0, timer_idx);
     timer_spinlock_give(TIMER_GROUP_0);
 }
@@ -274,22 +283,18 @@ static void  t_isr_handler_T1(void* arg)
 
 
 
-
-
-
-
-
-
-
 static void venting(void* arg)
 {
 	fan_event_t send_data;
-	printf("[venting task] send_data.timer_counter_value = [%d]\n", send_data.speed);
+	
+	//printf("[venting task] send_data.timer_counter_value = [%d]\n", send_data.speed);
     send_data.speed = 0;
 	uint8_t i = 0;
+	
     for(;;) {
 		while(i <= 2)
 		{
+			ESP_LOGI(TAG, "[venting] send_data.timer_counter_value = [%d]\n", send_data.speed");
 			vTaskDelay(5000 / portTICK_RATE_MS);
 			xQueueSendToBack(xQueueDIM, &send_data, portMAX_DELAY);
 			send_data.speed = send_data.speed + i;
@@ -313,10 +318,10 @@ static uint8_t msgData[] = "Hello, world";
 void sendMessages(void* pvParameter)
 {
     while (1) {
-        printf("Sending message...\n");
+		ESP_LOGI(TAG, "[sendMessages] Sending message...");
+        //printf("Sending message...\n");
         TTNResponseCode res = ttn.transmitMessage(msgData, sizeof(msgData) - 1);
         printf(res == kTTNSuccessfulTransmission ? "Message sent.\n" : "Transmission failed.\n");
-
         vTaskDelay(TX_INTERVAL * 1000 / portTICK_PERIOD_MS);
     }
 }
@@ -357,21 +362,24 @@ extern "C" void app_main(void)
     printf("Joining...\n");
     if (ttn.join())
     {
-        printf("Joined.\n");
+		ESP_LOGI(TAG, "Joined");
+        //printf("Joined.\n");
         xTaskCreate(sendMessages, "send_messages", 1024 * 4, (void* )0, 3, nullptr);
 		//xTaskCreate(venting, "fan_work", 1024 * 4,  NULL, 11, NULL);
     }
     else
     {
-        printf("Join failed. Goodbye\n");
+		ESP_LOGE(TAG, "Join failed. Goodbye");
+        //printf("Join failed. Goodbye\n");
     }
 	
 	xQueueDIM = xQueueCreate(5, sizeof(fan_event_t));
-	//tg0_timer_init(TIMER_0, WITH_RELOAD, TIMER0_INTERVAL_SWITCH_ON_TRIAC);
-    //tg0_timer_init(TIMER_1, WITH_RELOAD, TIMER1_INTERVAL_DELAY);
+	
 	xTaskCreate(venting, "test_fan_work", 1024 * 4,  NULL, 11, NULL);
 	
-	vSemaphoreCreateBinary(xBinarySemaphore1);
+	vSemaphoreCreateBinary(xBinSemaphoreZS);
+	vSemaphoreCreateBinary(xBinSemaphoreT0);
+	vSemaphoreCreateBinary(xBinSemaphoreT1);
 	
 	xTaskCreate(t_isr_handler_ZS, "task isr handler Zero Sensor", 1024 * 4,  NULL, 12, NULL);
 	xTaskCreate(t_isr_handler_T0, "task isr handler T0", 1024 * 4,  NULL, 12, NULL);
