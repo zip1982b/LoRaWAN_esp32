@@ -9,18 +9,57 @@
  *
  * Sample program showing how to send a test message every 30 second.
  *******************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
+#include <unistd.h>
+#include "esp_timer.h"
+
+#include "esp_types.h"
 #include "freertos/FreeRTOS.h"
-#include "esp_event.h"
-#include "nvs_flash.h"
+#include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
+
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+#include "driver/periph_ctrl.h"
 
 #include "TheThingsNetwork.h"
 
+//#include "DHT.h"
 
-static const char* TAG = "LoRaWAN";
 
+
+#define DHT_OK 0
+#define DHT_CHECKSUM_ERROR -1
+#define DHT_TIMEOUT_ERROR -2
+
+// == function prototypes =======================================
+
+void setDHTgpio(gpio_num_t gpio);
+void errorHandler(int response);
+int readDHT();
+float getHumidity();
+float getTemperature();
+int getSignalLevel(int usTimeOut, bool state);
+
+gpio_num_t DHTgpio = GPIO_NUM_33; // my default DHT pin = 4
+float humidity = 0.;
+float temperature = 0.;
+
+
+
+static void startingTRIAC_timer_callback(void* arg);
+static void delay_timer_callback(void* arg);
+
+static const char* TAG_lora = "LoRaWAN";
+static const char* TAG_vent = "VentSys";
+static const char* TAG_dht = "DHT22";
 
 // NOTE:
 // The LoRaWAN frequency and the radio chip must be configured by running 'make menuconfig'.
@@ -55,19 +94,22 @@ const char *appKey = "3d23df2458d8fda3aadb1c3f2a6e4fe8";
  * GPIO34:  input, interrupt from rising edge and falling edge - zero sensor
  * 
  */
+ 
+#ifdef __cplusplus
+extern "C"{
+#endif
+
 #define FAN				32
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<FAN))
 #define ZERO_SENSOR			34
 #define GPIO_INPUT_PIN_SEL  ((1ULL<<ZERO_SENSOR))
 #define ESP_INTR_FLAG_DEFAULT 0
 
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
-#define TIMER_DIVIDER         16  //  Hardware timer clock divider
-#define TIMER_SCALE           (TIMER_BASE_CLK / TIMER_DIVIDER)  // convert counter value to seconds
-#define TIMER1_INTERVAL_SWITCH_ON_TRIAC   (0.00005) // for switch on TRIAC (sec) - 50uS
-#define SPEED_1   (0.005)   // for firing angle to be 90' for 220V 50Hz AC signal, we need to have a delay of 5 ms
-#define WITHOUT_RELOAD   0        
-#define WITH_RELOAD      1       
+
 
 
 
@@ -76,235 +118,141 @@ typedef struct {
 } fan_event_t;
 
 
+portBASE_TYPE xStatus_venting;
+portBASE_TYPE xStatus_task_isr_handler_ZS;
 
 xQueueHandle xQueueDIM;
 xSemaphoreHandle xBinSemaphoreZS;
-xSemaphoreHandle xBinSemaphoreT0;
-xSemaphoreHandle xBinSemaphoreT1;
 
 
 
 
-
-
-
-
-
-static void IRAM_ATTR gpio_isr_handler(void* arg)
+ static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
     uint32_t gpio_num = (uint32_t) arg;
 	static portBASE_TYPE xHigherPriorityTaskWoken;
 	xHigherPriorityTaskWoken = pdFALSE;
-	ESP_LOGI(TAG, "[gpio_isr_handler] in ISR \n");
 	if(gpio_num == ZERO_SENSOR){
-		ESP_LOGI(TAG, "[gpio_isr_handler] event ZERO_SENSOR \n");
 		xSemaphoreGiveFromISR(xBinSemaphoreZS, &xHigherPriorityTaskWoken);
 		if(xHigherPriorityTaskWoken)
 		{
-			ESP_LOGI(TAG, "[gpio_isr_handler] xHigherPriorityTaskWoken = TRUE - Yield");
-			taskYIELD_YIELD_FROM_ISR();
+			portYIELD_FROM_ISR();
 		}
 	}
 }
 
-
-
-
-/*
- * Timer group0 ISR handler
- * switch on TRIAC
- * switch off TRIAC
- */
-void IRAM_ATTR timer_group0_isr(void *para)
-{
-    timer_spinlock_take(TIMER_GROUP_0);
-    int timer_idx = (int) para;
-	ESP_LOGI(TAG, "[timer_group0_isr] para = %d", timer_idx);
-	uint32_t timer_intr = timer_group_get_intr_status_in_isr(TIMER_GROUP_0);
-	
-	static portBASE_TYPE xHigherPriorityTaskWoken;
-	xHigherPriorityTaskWoken = pdFALSE;
-	ESP_LOGI(TAG, "[timer_group0_isr] in ISR");
-	
-
-	if (timer_intr & TIMER_INTR_T0) {
-		ESP_LOGI(TAG, "[timer_group0_isr] T0 event");
-		timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
-		xSemaphoreGiveFromISR(xBinSemaphoreT0, &xHigherPriorityTaskWoken);
-		if(xHigherPriorityTaskWoken)
-		{
-			taskYIELD_YIELD_FROM_ISR();
-		}
-	}
-        
-    } 
-	else if (timer_intr & TIMER_INTR_T1) {
-		ESP_LOGI(TAG, "[timer_group0_isr] T1 event");
-        timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_1);
-		xSemaphoreGiveFromISR(xBinSemaphoreT1, &xHigherPriorityTaskWoken);
-		if(xHigherPriorityTaskWoken)
-		{
-			taskYIELD_YIELD_FROM_ISR();
-		}
-    } 
-    /* After the alarm has been triggered
-      we need enable it again, so it is triggered the next time */
-	ESP_LOGI(TAG, "[timer_group0_isr] enable alarm in isr\n");
-    timer_group_enable_alarm_in_isr(TIMER_GROUP_0, timer_idx);
-    timer_spinlock_give(TIMER_GROUP_0);
-}
 
 
 
 
 /* very high priority task*/
-static void  t_isr_handler_ZS(void* arg)
+static void  task_isr_handler_ZS(void* arg)
 {
-	/*
-	0 - off
-	1 - 50 % = 0.005mS
-	2 - 100 % = 0.01mS
-	*/
+	UBaseType_t uxPriority;
+	uxPriority = uxTaskPriorityGet(NULL);
+	ESP_LOGI(TAG_vent, "[task_isr_handler_ZS] Priority get = [%d]",  (uint8_t)uxPriority);
 	
-	/* Select and initialize basic parameters of the timer */
-    timer_config_t config;
-    config.divider = TIMER_DIVIDER;
-    config.counter_dir = TIMER_COUNT_UP;
-    config.counter_en = TIMER_PAUSE;
-    config.alarm_en = TIMER_ALARM_EN;
-    config.intr_type = TIMER_INTR_LEVEL;
-    config.auto_reload = WITH_RELOAD;
-#ifdef TIMER_GROUP_SUPPORTS_XTAL_CLOCK
-    config.clk_src = TIMER_SRC_CLK_APB;
-#endif
-    timer_init(TIMER_GROUP_0, TIMER_0, &config);
-
-    /* Timer's counter will initially start from value below.
-       Also, if auto_reload is set, this value will be automatically reload on alarm */
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0x00000000ULL);
-
-    /* Configure the alarm value and the interrupt on alarm. */
-    //timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, TIMER0_INTERVAL_DELAY * TIMER_SCALE);
-    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
-    timer_isr_register(TIMER_GROUP_0, TIMER_0, timer_group0_isr, (void *) TIMER_0, ESP_INTR_FLAG_IRAM, NULL);
-
+	/* Create a one-shot timer for starting TRIAC */
+	const esp_timer_create_args_t startingTRIAC_timer_args = {
+            .callback = &startingTRIAC_timer_callback,
+            /* name is optional, but may help identify the timer when debugging */
+            .name = "starting TRIAC"
+    };
+    esp_timer_handle_t startingTRIAC_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&startingTRIAC_timer_args, &startingTRIAC_timer));
+	
+	
+	
+	/* Create a one-shot timer for delay RMS */
+	const esp_timer_create_args_t delay_timer_args = {
+            .callback = &delay_timer_callback,
+			.arg = (void*) startingTRIAC_timer,
+            .name = "delay timer"
+    };
+	esp_timer_handle_t delay_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&delay_timer_args, &delay_timer));
+	
+	
+	uint32_t io_num;
 	fan_event_t received_data;
-	uint64_t alarm_value;
-	received_data.speed = 0;
+	uint8_t speed = 0;
+	ESP_LOGI(TAG_vent, "[task_isr_handler_ZS]esp_timer is configured");
 	
 	for(;;){
-		printf("Timer0 is configured  - Cicle - \n");
+		//ESP_LOGI(TAG, "[task_isr_handler_ZS] - Cicle -");
+		
 		xSemaphoreTake(xBinSemaphoreZS, portMAX_DELAY);
+		//xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY);
+			//ESP_LOGI(TAG, "[task_isr_handler_ZS] ionum = %d", io_num);
+		
+		
 		xQueueReceive(xQueueDIM, &received_data, 0);
-		switch(received_data.speed){
+		speed = received_data.speed;
+		
+		//ESP_LOGI(TAG, "[task_isr_handler_ZS] speed = %d", speed);
+		switch(speed){
 		case 0:
-			gpio_set_level(FAN, 0); //FAN switch off
+			gpio_set_level(GPIO_NUM_32, 0); //FAN switch off
+			//ESP_LOGI(TAG, "[task_isr_handler_ZS] Fan off");
 			break;
 		case 1:
-			timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0x00000000ULL);
-			alarm_value = (uint64_t) SPEED_1 * TIMER_SCALE; // FAN switch on - 50% speed
-			printf('Alarm value [%d] ',  alarm_value);
-			timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, alarm_value); // а до скольки считать?	
-			timer_start(TIMER_GROUP_0, TIMER_0); //T0 start
+			/* Start the one-shot timer */
+			esp_timer_start_once(delay_timer, 5000);
+			//ESP_LOGI(TAG, "[task_isr_handler_ZS] Started timer, time since boot: %lld us", esp_timer_get_time());
 			break;
 		case 2:
-			gpio_set_level(FAN, 1); //FAN switch on - 100% speed
+			gpio_set_level(GPIO_NUM_32, 1); //FAN switch on - 100% speed
+			//ESP_LOGI(TAG, "[task_isr_handler_ZS] FAN ON speed = 2");
 			break;
 		}
 	}
 }
 
 
-/* very high priority task*/
-static void  t_isr_handler_T0(void* arg)
-{
-	/*
-	1 - gpio_set_level(FAN, 1);
-	2 - T1 start;
-	*/
-	
-	/* Select and initialize basic parameters of the timer */
-    timer_config_t config;
-    config.divider = TIMER_DIVIDER;
-    config.counter_dir = TIMER_COUNT_UP;
-    config.counter_en = TIMER_PAUSE;
-    config.alarm_en = TIMER_ALARM_EN;
-    config.intr_type = TIMER_INTR_LEVEL;
-    config.auto_reload = WITH_RELOAD;
-#ifdef TIMER_GROUP_SUPPORTS_XTAL_CLOCK
-    config.clk_src = TIMER_SRC_CLK_APB;
-#endif
-    timer_init(TIMER_GROUP_0, TIMER_1, &config);
-
-    /* Timer's counter will initially start from value below.
-       Also, if auto_reload is set, this value will be automatically reload on alarm */
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0x00000000ULL);
-
-    /* Configure the alarm value and the interrupt on alarm. */
-    //timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, TIMER0_INTERVAL_DELAY * TIMER_SCALE);
-    timer_enable_intr(TIMER_GROUP_0, TIMER_1);
-    timer_isr_register(TIMER_GROUP_0, TIMER_1, timer_group0_isr, (void *) TIMER_1, ESP_INTR_FLAG_IRAM, NULL);
-
-	uint64_t alarm_value;
-	
-	for(;;){
-		printf("[t_isr_handler_T0] Timer1 is configured  - Cicle - \n");
-		xSemaphoreTake(xBinSemaphoreT0, portMAX_DELAY);
-		timer_pause(TIMER_GROUP_0, TIMER_0); //T0 pause
-		timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0x00000000ULL);
-		alarm_value = (uint64_t) TIMER1_INTERVAL_SWITCH_ON_TRIAC * TIMER_SCALE; // FAN switch on - 50% speed
-		printf('Alarm value [%d] ',  alarm_value);
-		timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, alarm_value); // а до скольки считать?	
-		timer_start(TIMER_GROUP_0, TIMER_1); //T1 start
-		gpio_set_level(FAN, 1); //FAN switch on 
-
-	}
-}
-
-
-/* very high priority task*/
-static void  t_isr_handler_T1(void* arg)
-{
-	/*
-	1 - gpio_set_level(FAN, 0);
-	*/
-	gpio_set_level(FAN, 0); //FAN switch off
-	
-	for(;;){
-		printf("[t_isr_handler_T1]   - Cicle - \n");
-		xSemaphoreTake(xBinSemaphoreT1, portMAX_DELAY);
-		timer_pause(TIMER_GROUP_0, TIMER_1); //T1 pause
-		gpio_set_level(FAN, 0); //FAN switch off
-	}
-}
 
 
 
 
 
 
-static void venting(void* arg)
+void DHT_task(void *pvParameter)
 {
 	fan_event_t send_data;
+    setDHTgpio(GPIO_NUM_33);
+    ESP_LOGI(TAG_dht, "Starting DHT Task\n\n");
+	float H;
+	float T;
+	float target_humidity = 30.2;// %
+	uint8_t delta = 2;
 	
-	//printf("[venting task] send_data.timer_counter_value = [%d]\n", send_data.speed);
-    send_data.speed = 0;
-	uint8_t i = 0;
 	
-    for(;;) {
-		while(i <= 2)
-		{
-			ESP_LOGI(TAG, "[venting] send_data.timer_counter_value = [%d]\n", send_data.speed");
-			vTaskDelay(5000 / portTICK_RATE_MS);
+    while (1)
+    {
+        //ESP_LOGI(TAG_dht, "=== Reading DHT ===\n");
+        int ret = readDHT();
+
+        errorHandler(ret);
+		
+		H = getHumidity();
+		T = getTemperature();
+		
+        ESP_LOGI(TAG_dht, "Hum: %.1f Tmp: %.1f", H, T);
+		
+		if(H <= target_humidity - delta){
+			ESP_LOGI(TAG_dht, "[DHT_task] Fan speed = 1");
+			send_data.speed = 1;
 			xQueueSendToBack(xQueueDIM, &send_data, portMAX_DELAY);
-			send_data.speed = send_data.speed + i;
-			i++;
 		}
-		send_data.speed = 0;
-		i = 0;
+		else if(H > target_humidity + delta){
+			ESP_LOGI(TAG_dht, "[DHT_task] Fan speed = 0");
+			send_data.speed = 0;
+			xQueueSendToBack(xQueueDIM, &send_data, portMAX_DELAY);
+		}
+        // -- wait at least 2 sec before reading again ------------
+        // The interval of whole process must be beyond 2 seconds !!
+        vTaskDelay(3000 / portTICK_RATE_MS);
     }
 }
-
 
 
 
@@ -318,7 +266,7 @@ static uint8_t msgData[] = "Hello, world";
 void sendMessages(void* pvParameter)
 {
     while (1) {
-		ESP_LOGI(TAG, "[sendMessages] Sending message...");
+		ESP_LOGI(TAG_lora, "[sendMessages] Sending message...");
         //printf("Sending message...\n");
         TTNResponseCode res = ttn.transmitMessage(msgData, sizeof(msgData) - 1);
         printf(res == kTTNSuccessfulTransmission ? "Message sent.\n" : "Transmission failed.\n");
@@ -333,14 +281,46 @@ void sendMessages(void* pvParameter)
 
 extern "C" void app_main(void)
 {
+	gpio_config_t io_conf;
+	/*** triac control ***/
+    io_conf.intr_type = GPIO_INTR_DISABLE; //disable interrupt
+    io_conf.mode = GPIO_MODE_OUTPUT; //set as output mode
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL; //bit mask of the pins that you want to set,e.g.GPIO32/33
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; //disable pull-down mode
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE; //disable pull-up mode
+    gpio_config(&io_conf); //configure GPIO with the given settings
+	/*********************/
+	
+	/*** zero sensor ***/
+    io_conf.intr_type = GPIO_INTR_ANYEDGE; //interrupt ANYEDGE
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL; //bit mask of the pins, use GPIO34 here
+    io_conf.mode = GPIO_MODE_INPUT; //set as input mode
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE; //enable pull-up mode
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; //disable pull-down_cw mode - отключитли подтяжку к земле
+    gpio_config(&io_conf);
+	/*********************/
+	
+	//install gpio isr service
+    //gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    //hook isr handler for specific gpio pin
+    //gpio_isr_handler_add(ZERO_SENSOR, gpio_isr_handler, (void*) ZERO_SENSOR);
+	
     esp_err_t err;
     // Initialize the GPIO ISR handler service
     err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+	gpio_isr_handler_add(GPIO_NUM_32, gpio_isr_handler, (void*) GPIO_NUM_32);
     ESP_ERROR_CHECK(err);
 
     // Initialize the NVS (non-volatile storage) for saving and restoring the keys
     err = nvs_flash_init();
     ESP_ERROR_CHECK(err);
+
+	
+
+
+
+
+
 
     // Initialize SPI bus
     spi_bus_config_t spi_bus_config;
@@ -362,26 +342,249 @@ extern "C" void app_main(void)
     printf("Joining...\n");
     if (ttn.join())
     {
-		ESP_LOGI(TAG, "Joined");
-        //printf("Joined.\n");
+		ESP_LOGI(TAG_lora, "Joined");
+        
         xTaskCreate(sendMessages, "send_messages", 1024 * 4, (void* )0, 3, nullptr);
-		//xTaskCreate(venting, "fan_work", 1024 * 4,  NULL, 11, NULL);
+		vSemaphoreCreateBinary(xBinSemaphoreZS);
+		xQueueDIM = xQueueCreate(5, sizeof(fan_event_t));
+	
+	
+		xStatus_task_isr_handler_ZS = xTaskCreate(task_isr_handler_ZS, "task isr handler Zero Sensor", 1024 * 4,  NULL, 8, NULL); //&xZS_Handle
+		if(xStatus_task_isr_handler_ZS == pdPASS)
+			ESP_LOGI(TAG_vent, "[app_main] Task [task isr handler Zero Sensor] is created");
+		else
+			ESP_LOGI(TAG_vent, "[app_main] Task [task isr handler Zero Sensor] is not created");
+
+		xTaskCreate(&DHT_task, "DHT_task", 2048, NULL, 5, NULL);
     }
     else
     {
-		ESP_LOGE(TAG, "Join failed. Goodbye");
-        //printf("Join failed. Goodbye\n");
+		ESP_LOGE(TAG_lora, "Join failed. Goodbye");
     }
-	
-	xQueueDIM = xQueueCreate(5, sizeof(fan_event_t));
-	
-	xTaskCreate(venting, "test_fan_work", 1024 * 4,  NULL, 11, NULL);
-	
-	vSemaphoreCreateBinary(xBinSemaphoreZS);
-	vSemaphoreCreateBinary(xBinSemaphoreT0);
-	vSemaphoreCreateBinary(xBinSemaphoreT1);
-	
-	xTaskCreate(t_isr_handler_ZS, "task isr handler Zero Sensor", 1024 * 4,  NULL, 12, NULL);
-	xTaskCreate(t_isr_handler_T0, "task isr handler T0", 1024 * 4,  NULL, 12, NULL);
-	xTaskCreate(t_isr_handler_T1, "task isr handler T1", 1024 * 4,  NULL, 12, NULL);
 }
+
+
+static void delay_timer_callback(void* arg)
+{
+    //int64_t time_since_boot = esp_timer_get_time();
+    esp_timer_handle_t startingTRIAC_timer_handle = (esp_timer_handle_t) arg;
+	gpio_set_level(GPIO_NUM_32, 1); //FAN switch on 
+	//ESP_LOGI(TAG, "[task_isr_handler_ZS] Fan on half");
+    /* To start the timer which is running, need to stop it first */
+    ESP_ERROR_CHECK(esp_timer_start_once(startingTRIAC_timer_handle, 50));
+    //ESP_LOGI(TAG, "[delay_timer_callback] startingTRIAC_timer start once");
+}
+
+
+static void startingTRIAC_timer_callback(void* arg)
+{
+	gpio_set_level(GPIO_NUM_32, 0); //FAN switch off
+}
+
+
+// == set the DHT used pin=========================================
+
+void setDHTgpio(gpio_num_t gpio)
+{
+    DHTgpio = gpio;
+}
+
+// == get temp & hum =============================================
+
+float getHumidity() { return humidity; }
+float getTemperature() { return temperature; }
+
+// == error handler ===============================================
+
+void errorHandler(int response)
+{
+    switch (response)
+    {
+
+    case DHT_TIMEOUT_ERROR:
+        ESP_LOGE(TAG_dht, "Sensor Timeout\n");
+        break;
+
+    case DHT_CHECKSUM_ERROR:
+        ESP_LOGE(TAG_dht, "CheckSum error\n");
+        break;
+
+    case DHT_OK:
+        break;
+
+    default:
+        ESP_LOGE(TAG_dht, "Unknown error\n");
+    }
+}
+
+/*-------------------------------------------------------------------------------
+;
+;	get next state 
+;
+;	I don't like this logic. It needs some interrupt blocking / priority
+;	to ensure it runs in realtime.
+;
+;--------------------------------------------------------------------------------*/
+
+int getSignalLevel(int usTimeOut, bool state)
+{
+
+    int uSec = 0;
+    while (gpio_get_level(DHTgpio) == state)
+    {
+
+        if (uSec > usTimeOut)
+            return -1;
+
+        ++uSec;
+        ets_delay_us(1); // uSec delay
+    }
+
+    return uSec;
+}
+
+/*----------------------------------------------------------------------------
+;
+;	read DHT22 sensor
+
+copy/paste from AM2302/DHT22 Docu:
+
+DATA: Hum = 16 bits, Temp = 16 Bits, check-sum = 8 Bits
+
+Example: MCU has received 40 bits data from AM2302 as
+0000 0010 1000 1100 0000 0001 0101 1111 1110 1110
+16 bits RH data + 16 bits T data + check sum
+
+1) we convert 16 bits RH data from binary system to decimal system, 0000 0010 1000 1100 → 652
+Binary system Decimal system: RH=652/10=65.2%RH
+
+2) we convert 16 bits T data from binary system to decimal system, 0000 0001 0101 1111 → 351
+Binary system Decimal system: T=351/10=35.1°C
+
+When highest bit of temperature is 1, it means the temperature is below 0 degree Celsius. 
+Example: 1000 0000 0110 0101, T= minus 10.1°C: 16 bits T data
+
+3) Check Sum=0000 0010+1000 1100+0000 0001+0101 1111=1110 1110 Check-sum=the last 8 bits of Sum=11101110
+
+Signal & Timings:
+
+The interval of whole process must be beyond 2 seconds.
+
+To request data from DHT:
+
+1) Sent low pulse for > 1~10 ms (MILI SEC)
+2) Sent high pulse for > 20~40 us (Micros).
+3) When DHT detects the start signal, it will pull low the bus 80us as response signal, 
+   then the DHT pulls up 80us for preparation to send data.
+4) When DHT is sending data to MCU, every bit's transmission begin with low-voltage-level that last 50us, 
+   the following high-voltage-level signal's length decide the bit is "1" or "0".
+	0: 26~28 us
+	1: 70 us
+
+;----------------------------------------------------------------------------*/
+
+#define MAXdhtData 5 // to complete 40 = 5*8 Bits
+
+int readDHT()
+{
+    int uSec = 0;
+
+    uint8_t dhtData[MAXdhtData];
+    uint8_t byteInx = 0;
+    uint8_t bitInx = 7;
+
+    for (int k = 0; k < MAXdhtData; k++)
+        dhtData[k] = 0;
+
+    // == Send start signal to DHT sensor ===========
+
+    gpio_set_direction(DHTgpio, GPIO_MODE_OUTPUT);
+
+    // pull down for 3 ms for a smooth and nice wake up
+    gpio_set_level(DHTgpio, 0);
+    ets_delay_us(3000);
+
+    // pull up for 25 us for a gentile asking for data
+    gpio_set_level(DHTgpio, 1);
+    ets_delay_us(25);
+
+    gpio_set_direction(DHTgpio, GPIO_MODE_INPUT); // change to input mode
+
+    // == DHT will keep the line low for 80 us and then high for 80us ====
+
+    uSec = getSignalLevel(85, 0);
+    ESP_LOGD(TAG_dht, "Response = %d", uSec);
+    if (uSec < 0)
+        return DHT_TIMEOUT_ERROR;
+
+    // -- 80us up ------------------------
+
+    uSec = getSignalLevel(85, 1);
+    ESP_LOGD(TAG_dht, "Response = %d", uSec);
+    if (uSec < 0)
+        return DHT_TIMEOUT_ERROR;
+
+    // == No errors, read the 40 data bits ================
+
+    for (int k = 0; k < 40; k++)
+    {
+
+        // -- starts new data transmission with >50us low signal
+
+        uSec = getSignalLevel(56, 0);
+        if (uSec < 0)
+            return DHT_TIMEOUT_ERROR;
+
+        // -- check to see if after >70us rx data is a 0 or a 1
+
+        uSec = getSignalLevel(75, 1);
+        if (uSec < 0)
+            return DHT_TIMEOUT_ERROR;
+
+        // add the current read to the output data
+        // since all dhtData array where set to 0 at the start,
+        // only look for "1" (>28us us)
+
+        if (uSec > 40)
+        {
+            dhtData[byteInx] |= (1 << bitInx);
+        }
+
+        // index to next byte
+
+        if (bitInx == 0)
+        {
+            bitInx = 7;
+            ++byteInx;
+        }
+        else
+            bitInx--;
+    }
+
+    // == get humidity from Data[0] and Data[1] ==========================
+
+    humidity = dhtData[0];
+    humidity *= 0x100; // >> 8
+    humidity += dhtData[1];
+    humidity /= 10; // get the decimal
+
+    // == get temp from Data[2] and Data[3]
+
+    temperature = dhtData[2] & 0x7F;
+    temperature *= 0x100; // >> 8
+    temperature += dhtData[3];
+    temperature /= 10;
+
+    if (dhtData[2] & 0x80) // negative temp, brrr it's freezing
+        temperature *= -1;
+
+    // == verify if checksum is ok ===========================================
+    // Checksum is the sum of Data 8 bits masked out 0xFF
+
+    if (dhtData[4] == ((dhtData[0] + dhtData[1] + dhtData[2] + dhtData[3]) & 0xFF))
+        return DHT_OK;
+
+    else
+        return DHT_CHECKSUM_ERROR;
+}
+
